@@ -1,0 +1,135 @@
+#!/usr/bin/env perl
+
+use 5.10.1;
+use strict;
+use warnings;
+use Getopt::Long::Descriptive;
+use JSON::PP;
+use Path::Tiny qw/path/;
+
+# OO interface to JSON for prettry printing
+my $json = JSON::PP->new->pretty->allow_nonref;
+
+sub description {
+    <<'BLURB'
+Inject a Packer provisioner into a Boxcutter template.
+
+This script helps create a new Packer template from an existing Boxcutter
+template. e.g., you can use it to inject a Salt Masterless provisioner after
+the `custom-script.sh`.
+BLURB
+}
+
+sub opt_spec {
+    return (
+        ['provisioner|p=s',          'provisioner JSON file to inject'],
+        ['provisioner-template|t=s', 'use a preexisting provisioner template'],
+        ['provisioner-template-list|l', 'list provisioner templates'],
+        ['inspect|i', 'print only `provisioners` JSON to STDOUT'],
+        [],
+        ['help', 'print usage message and exit', {shortcircuit => 1}],
+    );
+}
+
+sub provisioner_templates {
+    return {
+        'salt-masterless' => {
+            "type"               => "salt-masterless",
+            "local_state_tree"   => "../../salt/recipe",
+            "local_pillar_roots" => "../../salt/pillar",
+            "minion_config"      => "../../salt/etc/minion"
+        },
+    };
+}
+
+sub usage_desc {
+    '%c %o TEMPLATE'
+}
+
+my ($opt, $usage) = describe_options(usage_desc(), opt_spec());
+print(description() . "\n\n" . $usage->text), exit if $opt->help;
+
+my $provisioner_templates = provisioner_templates();
+
+# Display JSON output of the template list compiled into this script. Only
+# contains `salt-masterless` but might be expanded in the future.
+if ($opt->provisioner_template_list) {
+    print $json->encode($provisioner_templates);
+    exit;
+}
+
+# If a template has been selected, make sure that it exists, else list other
+# suitable options.
+if (my $pt = $opt->provisioner_template) {
+    my @pts = (keys %$provisioner_templates);
+    die "Provisioner template '$pt' does not exist [@pts]\n"
+      unless exists $provisioner_templates->{$pt};
+}
+
+# A single argument is required, which must be an existing Boxcutter Packer
+# template. There are no heuristics to know if the type of JSON file is a
+# Boxcutter one, but things will complain loudly if it doesn't follow its
+# expected outline.
+my $template = shift @ARGV;
+die "Mandatory argument 'TEMPLATE' missing. e.g., debian.json\n\n"
+  . $usage->text
+  unless defined $template;
+
+$template = path($template);
+die "$template: $!\n" unless $template->exists;
+my $template_json = decode_json $template->slurp;
+
+my $provisioner_json;
+if ($opt->provisioner) {
+    my $provisioner = path($opt->provisioner);
+    die "$template: $!\n" unless $template->exists;
+    $provisioner_json = decode_json $provisioner->slurp;
+}
+elsif (my $pt = $opt->provisioner_template) {
+    $provisioner_json = $provisioner_templates->{$pt};
+}
+
+# Check that the `provisioners` top-level key exists, that it contains 1
+# provisioner, and the provisioner is a shell.
+die "$template: does not contain top-level `provisioners` key"
+  unless exists $template_json->{provisioners};
+die "$template: contains more than one provisioner in `provisioners`"
+  unless scalar @{$template_json->{provisioners}} == 1;
+die "$template: does not contain `scripts` under top-level `provisioners` key"
+  unless exists $template_json->{provisioners}->[0]->{scripts};
+die "$template: expecting only top-level `provisioners` key to be `shell`, not `$template_json->{provisioners}->[0]->{type}`"
+  unless $template_json->{provisioners}->[0]->{type} eq 'shell';
+
+# Find the right place to inject the provisioner JSON. This will be just after
+# `custom-script.sh`. It's possible that this won't exist, but will have to
+# patch this script if that's ever an issue.
+push @{$template_json->{provisioners}}, $provisioner_json;
+
+# This is a hacky way to clone a deep structure, selected to reduce the
+# amount of dependencies for fat packing.
+push @{$template_json->{provisioners}},
+  decode_json(encode_json($template_json->{provisioners}->[0]));
+
+# Get the shell `scripts`. These need to be tweaks so that the pre and post
+# shell scripts only run each script once.
+my @pre_scripts  = @{$template_json->{provisioners}->[0]->{scripts}};
+my @post_scripts = @pre_scripts;
+
+my $add = 1;
+@pre_scripts = grep { $_ eq 'custom-script.sh' ? $add-- : $add } @pre_scripts;
+$add = 0;
+@post_scripts = grep { $_ eq 'custom-script.sh' ? $add++ : $add } @post_scripts;
+
+# Update pre- and post- shell provisioners with modified script array
+$template_json->{provisioners}->[0]->{scripts} = \@pre_scripts;
+$template_json->{provisioners}->[2]->{scripts} = \@post_scripts;
+
+# Allow the user to inspect just the `provisioners` key
+if ($opt->inspect) {
+    print $json->encode({provisioners => $template_json->{provisioners}});
+    exit;
+}
+
+# Print the modified template - the user needs to redirect the output if they'd
+# like this template to persist.
+print $json->encode($template_json);
